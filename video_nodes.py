@@ -1,0 +1,1010 @@
+"""
+ComfyUI-Bruxos-do-VFX — Video I/O
+=================================
+Dois nodes no estilo do VideoHelperSuite, porem compativeis com o tipo VIDEO
+nativo dos nodes "2.0" do ComfyUI:
+
+  * Bruxos Load Video   -> images, video (VIDEO nativo), audio, fps, frame_count, video_info
+  * Bruxos Save Video   -> exporta MP4 e/ou sequencia de PNG, criando pastas.
+
+Backends de decode/encode em camadas: PyAV (vem com o ComfyUI) -> imageio-ffmpeg
+-> OpenCV. O codigo degrada com elegancia se algum nao estiver disponivel.
+"""
+
+import os
+import json
+import hashlib
+import logging
+import datetime
+from fractions import Fraction
+
+import numpy as np
+import torch
+
+# ---- fit/crop compartilhado com o Load Image ------------------------------
+try:
+    from .bruxos_load_media import _bx_apply_fit, ASPECTS as _BX_ASPECTS, FIT_MODES as _BX_FIT_MODES
+except Exception:  # pragma: no cover
+    _bx_apply_fit = None
+    _BX_ASPECTS = ["livre", "1:1", "3:4", "4:3", "16:9", "9:16"]
+    _BX_FIT_MODES = ["off (original)", "crop", "stretch", "pad (letterbox)"]
+
+# ---- ComfyUI helpers (guardados p/ rodar fora do Comfy em teste) ----------
+try:
+    import folder_paths
+    _HAS_FP = True
+except Exception:
+    folder_paths = None
+    _HAS_FP = False
+
+# tipo VIDEO nativo (nodes 2.0). Import guardado: varia por versao do ComfyUI.
+_VIDEO_API = None
+try:
+    from comfy_api.latest import InputImpl as _InputImpl, Types as _Types
+    _VIDEO_API = "latest"
+except Exception:
+    try:
+        from comfy_api.input_impl import VideoFromComponents as _VFC  # type: ignore
+        from comfy_api.util import VideoComponents as _VComp           # type: ignore
+        _VIDEO_API = "legacy"
+    except Exception:
+        _VIDEO_API = None
+
+# backends de midia
+try:
+    import av  # PyAV (vem com o ComfyUI)
+    _HAS_AV = True
+except Exception:
+    _HAS_AV = False
+try:
+    import imageio
+    import imageio_ffmpeg  # noqa: F401
+    _HAS_IMAGEIO = True
+except Exception:
+    _HAS_IMAGEIO = False
+try:
+    import cv2
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
+
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".gif", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv")
+
+
+# ===========================================================================
+# Helpers de decode
+# ===========================================================================
+def _list_input_videos():
+    if not _HAS_FP:
+        return []
+    d = folder_paths.get_input_directory()
+    out = []
+    try:
+        for f in os.listdir(d):
+            if f.lower().endswith(VIDEO_EXTS) and os.path.isfile(os.path.join(d, f)):
+                out.append(f)
+    except Exception:
+        pass
+    return sorted(out)
+
+
+def _resolve_path(video, video_path):
+    if video_path and str(video_path).strip():
+        p = str(video_path).strip().strip('"')
+        if os.path.isfile(p):
+            return p
+    if video and _HAS_FP:
+        cand = os.path.join(folder_paths.get_input_directory(), video)
+        if os.path.isfile(cand):
+            return cand
+    if video and os.path.isfile(video):
+        return video
+    raise FileNotFoundError(f"[Bruxos Load Video] video nao encontrado: video={video!r} video_path={video_path!r}")
+
+
+def _input_preview_ref(video, video_path):
+    """Devolve {filename, subfolder, type, format} se o video estiver no diretorio
+    de input do ComfyUI (pro preview via /view). Retorna None caso contrario
+    (ex.: caminho absoluto fora do input, que o /view nao serve)."""
+    if video_path and str(video_path).strip():
+        return None
+    if not (video and _HAS_FP):
+        return None
+    try:
+        in_dir = folder_paths.get_input_directory()
+        cand = os.path.join(in_dir, video)
+        if not os.path.isfile(cand):
+            return None
+        rel = os.path.relpath(cand, in_dir).replace("\\", "/")
+        subfolder = os.path.dirname(rel)
+        filename = os.path.basename(rel)
+        ext = os.path.splitext(filename)[1].lower().lstrip(".") or "mp4"
+        return {"filename": filename, "subfolder": subfolder,
+                "type": "input", "format": "video/" + ext}
+    except Exception:
+        return None
+
+
+def _iter_frames_imageio(path):
+    rdr = imageio.get_reader(path, "ffmpeg")
+    meta = rdr.get_meta_data()
+    fps = float(meta.get("fps", 0) or 0)
+    for frame in rdr:
+        yield np.asarray(frame)[..., :3], fps
+    rdr.close()
+
+
+def _iter_frames_cv2(path):
+    cap = cv2.VideoCapture(path)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        yield cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), fps
+    cap.release()
+
+
+def _iter_frames_av(path):
+    container = av.open(path)
+    stream = container.streams.video[0]
+    fps = float(stream.average_rate) if stream.average_rate else 0.0
+    for frame in container.decode(stream):
+        yield frame.to_ndarray(format="rgb24"), fps
+    container.close()
+
+
+def _iter_frames_av_hi(path):
+    """Como _iter_frames_av, mas decodifica em 16-bit (rgb48le) em vez de
+    8-bit (rgb24) -- preserva a precisao real de fontes 10/12-bit (ProRes,
+    H.265 Main10, video vindo de outra ferramenta em alta profundidade etc.)
+    em vez de truncar pra 8-bit ja no import. Fonte que so tem 8-bit mesmo:
+    o resultado final e numericamente identico ao caminho normal (upsample
+    exato, sem perda nem invencao de informacao) -- so custa mais CPU.
+
+    Funcao ISOLADA de proposito: _iter_frames_av/_frame_iterator continuam
+    8-bit sem mudanca nenhuma, porque bruxos_disk_stream.py consome os
+    frames de _frame_iterator direto e assume uint8 (cache SSD "lossless-u8");
+    misturar 16-bit ali corromperia esse cache."""
+    container = av.open(path)
+    stream = container.streams.video[0]
+    fps = float(stream.average_rate) if stream.average_rate else 0.0
+    for frame in container.decode(stream):
+        yield frame.to_ndarray(format="rgb48le"), fps
+    container.close()
+
+
+def _frame_iterator(path):
+    """Itera (frame_rgb_uint8, source_fps). Tenta av -> imageio -> cv2."""
+    if _HAS_AV:
+        try:
+            yield from _iter_frames_av(path); return
+        except Exception as e:
+            logging.warning(f"[Bruxos] av falhou ({e}); tentando imageio")
+    if _HAS_IMAGEIO:
+        try:
+            yield from _iter_frames_imageio(path); return
+        except Exception as e:
+            logging.warning(f"[Bruxos] imageio falhou ({e}); tentando cv2")
+    if _HAS_CV2:
+        yield from _iter_frames_cv2(path); return
+    raise RuntimeError("[Bruxos] Nenhum backend de video disponivel (av / imageio-ffmpeg / opencv).")
+
+
+def _resize_frame(f, cw, ch):
+    H, W = f.shape[:2]
+    if cw <= 0 and ch <= 0:
+        return f
+    if cw > 0 and ch > 0:
+        tw, th = cw, ch
+    elif cw > 0:
+        tw = cw; th = max(1, round(H * cw / W))
+    else:
+        th = ch; tw = max(1, round(W * ch / H))
+    if (tw, th) == (W, H):
+        return f
+    if _HAS_CV2:
+        interp = cv2.INTER_AREA if (tw < W or th < H) else cv2.INTER_CUBIC
+        return cv2.resize(f, (tw, th), interpolation=interp)
+    # fallback torch
+    t = torch.from_numpy(f).permute(2, 0, 1).unsqueeze(0).float()
+    t = torch.nn.functional.interpolate(t, size=(th, tw), mode="bicubic", align_corners=False)
+    return t.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().numpy()
+
+
+def decode_video(path, skip_first_frames=0, frame_load_cap=0, select_every_nth=1,
+                 force_rate=0.0, custom_width=0, custom_height=0):
+    """Retorna (images_tensor[B,H,W,3] float 0..1, source_fps, out_fps)."""
+    select_every_nth = max(1, int(select_every_nth))
+    frames = []
+    src_fps = 0.0
+    kept = 0
+    next_tick = 0.0
+    step = None
+    idx = -1
+    for raw, sfps in _frame_iterator(path):
+        if sfps:
+            src_fps = sfps
+        idx += 1
+        if idx < skip_first_frames:
+            continue
+        j = idx - skip_first_frames
+        if force_rate and src_fps:
+            if step is None:
+                step = src_fps / float(force_rate)
+            if j < next_tick - 1e-9:
+                continue
+            next_tick += step
+        else:
+            if j % select_every_nth != 0:
+                continue
+        frames.append(_resize_frame(raw, custom_width, custom_height))
+        kept += 1
+        if frame_load_cap and kept >= frame_load_cap:
+            break
+
+    if not frames:
+        raise RuntimeError("[Bruxos Load Video] nenhum frame decodificado (cheque skip/cap/path).")
+
+    # garante shape uniforme (caso custom resize off e video tenha mudanca rara)
+    h0, w0 = frames[0].shape[:2]
+    arr = np.stack([f if f.shape[:2] == (h0, w0) else _resize_frame(f, w0, h0) for f in frames], 0)
+    frames = None  # libera a lista (mesmos dados do arr) antes de ir pra float32 -- manter
+    # os dois vivos ao mesmo tempo dobra a memoria a toa em lotes grandes.
+    # torch.from_numpy(arr) e uma VIEW (sem copia); .float() faz UMA copia pra float32;
+    # div_ e IN-PLACE (sem copia extra). "arr.astype(np.float32) / 255.0" fazia DUAS
+    # copias extras do lote inteiro -- foi essa linha que estourou a RAM do usuario
+    # (so 4GB, mas a maquina ja estava com bastante RAM ocupada por modelos grandes
+    # rodando na mesma sessao do ComfyUI).
+    images = torch.from_numpy(arr).float()
+    images.div_(255.0)
+    del arr
+
+    if force_rate:
+        out_fps = float(force_rate)
+    elif src_fps:
+        out_fps = src_fps / select_every_nth
+    else:
+        out_fps = 0.0
+    return images, src_fps, out_fps
+
+
+def _resize_frame_float(f, cw, ch):
+    """Como _resize_frame, mas mantem float32 0..1 (nunca quantiza pra uint8) --
+    usado so no decode de alta precisao (decode_video_hi)."""
+    H, W = f.shape[:2]
+    if cw <= 0 and ch <= 0:
+        return f
+    if cw > 0 and ch > 0:
+        tw, th = cw, ch
+    elif cw > 0:
+        tw = cw; th = max(1, round(H * cw / W))
+    else:
+        th = ch; tw = max(1, round(W * ch / H))
+    if (tw, th) == (W, H):
+        return f
+    if _HAS_CV2:
+        interp = cv2.INTER_AREA if (tw < W or th < H) else cv2.INTER_CUBIC
+        return cv2.resize(f, (tw, th), interpolation=interp)
+    t = torch.from_numpy(f).permute(2, 0, 1).unsqueeze(0).float()
+    t = torch.nn.functional.interpolate(t, size=(th, tw), mode="bicubic", align_corners=False)
+    return t.squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+
+
+def decode_video_hi(path, skip_first_frames=0, frame_load_cap=0, select_every_nth=1,
+                    force_rate=0.0, custom_width=0, custom_height=0):
+    """Igual a decode_video, mas decodifica via PyAV em 16-bit (rgb48le)
+    quando disponivel -- ve 'Importar em mais bits' no Load Video. Sem PyAV,
+    cai pro decode_video normal (8-bit)."""
+    if not _HAS_AV:
+        return decode_video(path, skip_first_frames, frame_load_cap, select_every_nth,
+                            force_rate, custom_width, custom_height)
+    select_every_nth = max(1, int(select_every_nth))
+    frames = []
+    src_fps = 0.0
+    kept = 0
+    next_tick = 0.0
+    step = None
+    idx = -1
+    try:
+        for raw16, sfps in _iter_frames_av_hi(path):
+            if sfps:
+                src_fps = sfps
+            idx += 1
+            if idx < skip_first_frames:
+                continue
+            j = idx - skip_first_frames
+            if force_rate and src_fps:
+                if step is None:
+                    step = src_fps / float(force_rate)
+                if j < next_tick - 1e-9:
+                    continue
+                next_tick += step
+            else:
+                if j % select_every_nth != 0:
+                    continue
+            f32 = raw16.astype(np.float32) / 65535.0
+            frames.append(_resize_frame_float(f32, custom_width, custom_height))
+            kept += 1
+            if frame_load_cap and kept >= frame_load_cap:
+                break
+    except Exception as e:
+        logging.warning(f"[Bruxos Load Video] decode em 16-bit falhou ({e}); caindo pro decode 8-bit normal.")
+        return decode_video(path, skip_first_frames, frame_load_cap, select_every_nth,
+                            force_rate, custom_width, custom_height)
+
+    if not frames:
+        raise RuntimeError("[Bruxos Load Video] nenhum frame decodificado (cheque skip/cap/path).")
+
+    h0, w0 = frames[0].shape[:2]
+    arr = np.stack([f if f.shape[:2] == (h0, w0) else _resize_frame_float(f, w0, h0) for f in frames], 0)
+    frames = None  # libera a lista antes de seguir -- ver comentario equivalente em decode_video
+    # frames aqui ja sao float32 (convertidos por frame antes do stack) -- .astype(np.float32)
+    # faria mais uma copia inteira do lote a toa. torch.from_numpy sem astype e zero-copy.
+    images = torch.from_numpy(arr)
+
+    if force_rate:
+        out_fps = float(force_rate)
+    elif src_fps:
+        out_fps = src_fps / select_every_nth
+    else:
+        out_fps = 0.0
+    return images, src_fps, out_fps
+
+
+def _extract_audio_av(path):
+    """Best-effort: AUDIO dict {'waveform':[1,C,N], 'sample_rate'} via PyAV."""
+    if not _HAS_AV:
+        return None
+    try:
+        container = av.open(path)
+        if not container.streams.audio:
+            container.close(); return None
+        astream = container.streams.audio[0]
+        sr = astream.rate
+        chunks = []
+        for frame in container.decode(astream):
+            chunks.append(frame.to_ndarray())
+        container.close()
+        if not chunks:
+            return None
+        data = np.concatenate(chunks, axis=1) if chunks[0].ndim == 2 else np.concatenate(chunks)[None, :]
+        wav = torch.from_numpy(np.ascontiguousarray(data)).float()
+        if wav.abs().max() > 1.5:  # int PCM
+            wav = wav / 32768.0
+        return {"waveform": wav.unsqueeze(0), "sample_rate": int(sr)}
+    except Exception as e:
+        logging.warning(f"[Bruxos] extracao de audio falhou: {e}")
+        return None
+
+
+def _make_video_obj(images, audio, fps):
+    """Constroi o objeto VIDEO nativo, se a API existir; senao None."""
+    if _VIDEO_API == "latest":
+        try:
+            comps = _Types.VideoComponents(images=images, audio=audio, frame_rate=Fraction(fps).limit_denominator(100000))
+            return _InputImpl.VideoFromComponents(comps)
+        except Exception as e:
+            logging.warning(f"[Bruxos] VideoFromComponents (latest) falhou: {e}")
+    elif _VIDEO_API == "legacy":
+        try:
+            comps = _VComp(images=images, audio=audio, frame_rate=Fraction(fps).limit_denominator(100000))
+            return _VFC(comps)
+        except Exception as e:
+            logging.warning(f"[Bruxos] VideoFromComponents (legacy) falhou: {e}")
+    return None
+
+
+# ===========================================================================
+# NODE: Load Video
+# ===========================================================================
+_BX_GIRO = ["off", "90 (horario)", "-90 (anti-horario)", "180"]
+
+
+def bx_rotacionar(t, giro):
+    """Gira um lote [B,H,W,C] ou uma mascara [B,H,W]. Devolve o mesmo tipo.
+
+    torch.rot90 com k=1 gira ANTI-HORARIO no plano (dims na ordem dada), entao
+    o horario e k=-1. Escrevi os rotulos com a direcao por extenso porque "90"
+    sozinho e ambiguo -- editor de video, camera e biblioteca de imagem nao
+    concordam sobre o sinal, e trocar isso depois quebraria grafos salvos.
+
+    -180 nao existe como opcao: e o mesmo que 180.
+    """
+    g = str(giro or "off")
+    if g.startswith("off"):
+        return t
+    dims = (1, 2)                      # (H, W) tanto em [B,H,W,C] quanto em [B,H,W]
+    if g.startswith("90"):
+        k = -1
+    elif g.startswith("-90"):
+        k = 1
+    elif g.startswith("180"):
+        k = 2
+    else:
+        return t
+    return torch.rot90(t, k, dims).contiguous()
+
+
+class BruxosLoadVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        files = _list_input_videos()
+        inputs = {
+            "required": {
+                "video": (files if files else ["(coloque videos em ComfyUI/input)"],
+                          {"tooltip": "Seletor de videos da pasta ComfyUI/input. Use o botao de upload pra enviar um novo."}),
+            },
+            "optional": {
+                "video_path": ("STRING", {"default": "", "tooltip": "Caminho absoluto (ex: C:\\\\...\\\\clip.mp4). Tem prioridade sobre o seletor."}),
+                "force_rate": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 0.01,
+                                         "tooltip": "Reamostra para esse fps. 0 = mantem o original."}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                                         "tooltip": "0 = mantem. Se so um lado for >0, mantem proporcao."}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                                          "tooltip": "Altura de saida em px. 0 = mantem. Se so um lado for >0, mantem a proporcao."}),
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 1_000_000,
+                                           "tooltip": "Maximo de frames a carregar. 0 = todos."}),
+                "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": 1_000_000,
+                                              "tooltip": "Pula os N primeiros frames do video."}),
+                "select_every_nth": ("INT", {"default": 1, "min": 1, "max": 1000,
+                                             "tooltip": "Pega 1 a cada N frames."}),
+                "reverse": ("BOOLEAN", {"default": False,
+                                        "tooltip": "Inverte a ordem dos frames (toca o video de tras pra frente). Aplica DEPOIS de skip/cap/nth."}),
+                # ---- FIT / CROP (box arrastavel via JS; aplicado depois do decode) ----
+                "fit_mode": (_BX_FIT_MODES, {"default": "off (original)",
+                    "tooltip": "off = como veio. crop = corta pelo box. stretch = estica pro alvo. pad = encaixa com bordas pretas. Aplica DEPOIS de custom_width/height."}),
+                "target_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Largura de saida do fit (px). 0 = mantem. So vale se fit_mode != off."}),
+                "target_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Altura de saida do fit (px). 0 = mantem."}),
+                "aspect": (_BX_ASPECTS, {"default": "livre",
+                    "tooltip": "Proporcao travada do box de corte (1:1, 3:4, 16:9, 9:16...). 'livre' = arrasta a vontade."}),
+                "crop_x": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Canto esquerdo do box (0..1), movido pelo box arrastavel."}),
+                "crop_y": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Topo do box (0..1)."}),
+                "crop_w": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.001,
+                    "tooltip": "Largura do box (0..1)."}),
+                "crop_h": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.001,
+                    "tooltip": "Altura do box (0..1)."}),
+                # ---------------------------------------------------------
+                # APPEND-ONLY: widget NOVO vai no FIM. O ComfyUI casa os
+                # widgets_values salvos por ORDEM, nao por nome -- inserir no
+                # meio desloca TODOS os valores dos grafos ja salvos.
+                # ---------------------------------------------------------
+                "girar": (_BX_GIRO, {"default": "off", "tooltip":
+                    "Gira os frames ANTES do fit/crop -- e por isso que ele fica aqui e nao "
+                    "depois: girar troca largura por altura, e o box de corte precisa ser "
+                    "calculado ja na orientacao final.\n\n"
+                    "Serve para o caso do celular: o arquivo guarda quadros 16:9 mais uma "
+                    "FLAG de rotacao, e decoder que ignora a flag entrega deitado.\n\n"
+                    "'-180' nao existe: e o mesmo que 180.\n"
+                    "As saidas 'width' e 'height' ja saem trocadas quando voce usa 90 ou -90."}),
+                "criar_cache_ssd": ("BOOLEAN", {"default": False, "tooltip":
+                    "Cria a saida Cache automaticamente no temp. Desligue no modo RAM puro do H3 Loop."}),
+                "importar_mais_bits": ("BOOLEAN", {"default": False, "tooltip":
+                    "Decodifica em 16-bit (rgb48le) via PyAV em vez de 8-bit direto -- preserva a "
+                    "precisao real de fontes 10/12-bit (ProRes, H.265 Main10, etc.) em vez de truncar "
+                    "ja no import. Se a fonte so tem 8-bit mesmo, o resultado e IDENTICO ao caminho "
+                    "normal (so custa mais CPU). Se der problema, desligue -- cai pro decode 8-bit de sempre."}),
+            },
+        }
+        # Usa o agrupamento advanced nativo dos dois renderers. Um botao
+        # customizado entraria em widgets_values e quebraria a restauracao por
+        # indice de workflows antigos.
+        for spec in inputs["optional"].values():
+            if len(spec) > 1 and isinstance(spec[1], dict):
+                spec[1]["advanced"] = True
+        return inputs
+
+    # APPEND-ONLY: Cache fica no fim para workflows antigos manterem os indices
+    # de todas as saidas que ja existiam.
+    RETURN_TYPES = ("IMAGE", "VIDEO", "AUDIO", "FLOAT", "INT", "INT", "INT", "STRING",
+                    "BRUXOS_FRAME_CACHE")
+    RETURN_NAMES = ("images", "video", "audio", "fps", "frame_count", "width", "height", "video_info",
+                    "Cache")
+    FUNCTION = "load"
+    CATEGORY = "Bruxos do VFX/Video"
+
+    def load(self, video, video_path="", force_rate=0.0, custom_width=0, custom_height=0,
+             frame_load_cap=0, skip_first_frames=0, select_every_nth=1, reverse=False,
+             fit_mode="off (original)", target_width=0, target_height=0,
+             aspect="livre", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0,
+             girar="off", criar_cache_ssd=False, importar_mais_bits=False):
+        path = _resolve_path(video, video_path)
+        decode_fn = decode_video_hi if importar_mais_bits else decode_video
+        images, src_fps, out_fps = decode_fn(
+            path, skip_first_frames, frame_load_cap, select_every_nth,
+            force_rate, custom_width, custom_height,
+        )
+        # ---- GIRO: antes do fit/crop, senao o box e calculado deitado ----
+        if str(girar).split()[0] != "off":
+            antes = tuple(images.shape[1:3])
+            images = bx_rotacionar(images, girar)
+            print(f"[Bruxos Load Video] girar {girar}: "
+                  f"{antes[1]}x{antes[0]} -> {images.shape[2]}x{images.shape[1]}", flush=True)
+        # ---- FIT / CROP (box) aplicado no lote de frames ----
+        if _bx_apply_fit is not None and str(fit_mode).split()[0] != "off":
+            try:
+                dummy_mask = torch.zeros((images.shape[0], images.shape[1], images.shape[2]),
+                                         dtype=images.dtype)
+                images, _ = _bx_apply_fit(
+                    images, dummy_mask, fit_mode,
+                    float(crop_x), float(crop_y), float(crop_w), float(crop_h),
+                    int(target_width), int(target_height),
+                )
+                images = images.contiguous()
+            except Exception as e:
+                logging.warning(f"[Bruxos Load Video] fit/crop falhou ({e}); frames sem corte.")
+        audio = _extract_audio_av(path)
+        video_obj = _make_video_obj(images, audio, out_fps if out_fps > 0 else (src_fps or 24.0))
+
+        if reverse and int(images.shape[0]) > 1:
+            images = images.flip(0)
+        B, H, W, _ = images.shape
+        info = {
+            "source_path": path,
+            "source_fps": round(src_fps, 4),
+            "output_fps": round(out_fps, 4),
+            "frame_count": int(B),
+            "width": int(W),
+            "height": int(H),
+            "has_audio": audio is not None,
+        }
+        info_json = json.dumps(info, ensure_ascii=False)
+
+        # Saida direta para o Bernini SSD81. O cache e lossless-u8, dividido em
+        # blocos fisicos de 81 frames e salvo automaticamente em ComfyUI/temp.
+        # O nome inclui arquivo + opcoes que alteram os frames; mudar qualquer
+        # uma delas cria outro cache, enquanto a mesma configuracao e reusada.
+        cache_path = ""
+        try:
+            if not bool(criar_cache_ssd):
+                info["cache_ssd"] = "desativado (modo RAM puro)"
+                raise StopIteration
+            stat = os.stat(path)
+            cache_key = {
+                "path": os.path.abspath(path), "mtime_ns": int(stat.st_mtime_ns),
+                "size": int(stat.st_size), "force_rate": float(force_rate),
+                "custom_width": int(custom_width), "custom_height": int(custom_height),
+                "frame_load_cap": int(frame_load_cap), "skip_first_frames": int(skip_first_frames),
+                "select_every_nth": int(select_every_nth), "reverse": bool(reverse),
+                "fit_mode": str(fit_mode), "target_width": int(target_width),
+                "target_height": int(target_height), "aspect": str(aspect),
+                "crop": [float(crop_x), float(crop_y), float(crop_w), float(crop_h)],
+                "girar": str(girar), "importar_mais_bits": bool(importar_mais_bits),
+            }
+            digest = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:12]
+            stem = os.path.splitext(os.path.basename(path))[0]
+            cache_name = f"load_video_{stem}_{digest}"
+            # Import tardio evita o ciclo: bruxos_disk_stream tambem usa os
+            # decoders deste modulo.
+            from .bruxos_disk_stream import BruxosImagensParaDisco
+            cache_path, _, _, cache_info = BruxosImagensParaDisco().run(
+                images, cache_name, 81,
+                float(out_fps if out_fps > 0 else (src_fps or 24.0)), False,
+            )
+            info["cache_ssd_81"] = cache_path
+            info["cache_info"] = cache_info
+            info_json = json.dumps(info, ensure_ascii=False)
+        except StopIteration:
+            info_json = json.dumps(info, ensure_ascii=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[Bruxos Load Video] nao foi possivel criar o Cache SSD81 automatico: {exc}"
+            ) from exc
+
+        result = (images, video_obj, audio,
+                  float(out_fps if out_fps > 0 else src_fps),
+                  int(B), int(W), int(H), info_json, cache_path)
+
+        # UI: infos pro node + ponteiro de preview (so quando vem do diretorio input)
+        ui = {"bruxos_info": [info_json]}
+        prev = _input_preview_ref(video, video_path)
+        if prev is not None:
+            ui["bruxos_video"] = [prev]
+        return {"ui": ui, "result": result}
+
+
+# ===========================================================================
+# Helpers de encode
+# ===========================================================================
+def _ffmpeg_exe():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _write_png_sequence(frames_arr, folder, prefix="frame", start=1):
+    """Aceita uint8 (PNG 8-bit) ou uint16 (PNG 16-bit real -- cv2.imwrite
+    detecta pelo dtype do array). Sem cv2, o fallback PIL so sabe RGB 8-bit;
+    frames uint16 sao cortados pra 8-bit ali (aviso no console)."""
+    os.makedirs(folder, exist_ok=True)
+    paths = []
+    warned = False
+    for i, f in enumerate(frames_arr):
+        fp = os.path.join(folder, f"{prefix}_{start + i:05d}.png")
+        if _HAS_CV2:
+            cv2.imwrite(fp, cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+        else:
+            from PIL import Image
+            if f.dtype == np.uint16:
+                if not warned:
+                    print("[Bruxos Save Video] PNG 16-bit precisa do OpenCV (cv2); sem ele, "
+                          "cortando a sequencia de PNG pra 8-bit (o MP4 10-bit nao e afetado).",
+                          flush=True)
+                    warned = True
+                f = (f.astype(np.float32) / 257.0).round().astype(np.uint8)
+            Image.fromarray(f).save(fp)
+        paths.append(fp)
+    return paths
+
+
+_CODEC_MAP = {"h264": "libx264", "h265": "libx265", "vp9": "libvpx-vp9", "prores": "prores_ks"}
+_PIXFMT_10BIT = {"yuv420p": "yuv420p10le", "yuv444p": "yuv444p10le", "yuv422p": "yuv422p10le"}
+
+
+def _apply_bit_depth(codec, pix_fmt, bit_depth):
+    """Ajusta codec/pix_fmt pro bit_depth pedido. Devolve (codec, pix_fmt, avisos)."""
+    avisos = []
+    if not str(bit_depth).startswith("10"):
+        return codec, pix_fmt, avisos
+    if codec == "h264":
+        avisos.append("h264 (libx264) nao suporta 10-bit de forma confiavel/compativel -- usando h265 no lugar.")
+        codec = "h265"
+    pix10 = _PIXFMT_10BIT.get(pix_fmt, pix_fmt if str(pix_fmt).endswith("10le") else "yuv420p10le")
+    if pix10 != pix_fmt:
+        avisos.append(f"pix_fmt {pix_fmt} -> {pix10} (variante 10-bit).")
+    return codec, pix10, avisos
+
+
+def _encode_mp4_imageio(frames_uint8, out_path, fps, codec="h264", crf=19, pix_fmt="yuv420p"):
+    lib = _CODEC_MAP.get(codec, "libx264")
+    params = []
+    if codec in ("h264", "h265"):
+        params += ["-crf", str(crf)]
+    w = imageio.get_writer(out_path, fps=max(1.0, fps), codec=lib, pixelformat=pix_fmt,
+                           macro_block_size=None, ffmpeg_params=params if params else None)
+    for f in frames_uint8:
+        w.append_data(f)
+    w.close()
+    return out_path
+
+
+def _mux_audio(video_path, audio, fps):
+    """Anexa audio ao mp4 ja escrito, via ffmpeg CLI. Best-effort."""
+    if audio is None:
+        return video_path
+    try:
+        import subprocess, tempfile, wave
+        wav = audio["waveform"]
+        sr = int(audio["sample_rate"])
+        a = wav[0].cpu().numpy()  # [C, N]
+        a = np.clip(a, -1, 1)
+        pcm = (a.T * 32767.0).astype(np.int16)  # [N, C]
+        tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+        with wave.open(tmp_wav, "wb") as wf:
+            wf.setnchannels(pcm.shape[1] if pcm.ndim == 2 else 1)
+            wf.setsampwidth(2); wf.setframerate(sr)
+            wf.writeframes(pcm.tobytes())
+        out2 = video_path.rsplit(".", 1)[0] + "_a." + video_path.rsplit(".", 1)[1]
+        subprocess.run([_ffmpeg_exe(), "-y", "-i", video_path, "-i", tmp_wav,
+                        "-c:v", "copy", "-c:a", "aac", "-shortest", out2],
+                       check=True, capture_output=True)
+        os.replace(out2, video_path)
+        os.remove(tmp_wav)
+    except Exception as e:
+        logging.warning(f"[Bruxos] mux de audio falhou (video salvo sem audio): {e}")
+    return video_path
+
+
+# ===========================================================================
+# NODE: Save Video
+# ===========================================================================
+class BruxosSaveVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Frames a salvar."}),
+                "filename_prefix": ("STRING", {"default": "Bruxos/video",
+                    "tooltip": "Prefixo/caminho relativo dentro de ComfyUI/output. Subpastas sao criadas."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01,
+                    "tooltip": "Quadros por segundo do arquivo final."}),
+            },
+            "optional": {
+                "save_mp4": ("BOOLEAN", {"default": True,
+                    "tooltip": "Liga/desliga a exportacao do video."}),
+                "codec": (["h264", "h265", "vp9", "prores"], {"default": "h264",
+                    "tooltip": "h264/h265 -> .mp4; vp9 -> .webm; prores -> .mov."}),
+                "crf": ("INT", {"default": 19, "min": 0, "max": 51,
+                                "tooltip": "Menor = mais qualidade/maior arquivo (h264/h265)."}),
+                "pix_fmt": (["yuv420p", "yuv444p", "yuv422p"], {"default": "yuv420p",
+                    "tooltip": "Formato de pixel. yuv420p e o mais compativel com players."}),
+                "save_png_sequence": ("BOOLEAN", {"default": False,
+                    "tooltip": "Salva tambem a sequencia de PNG (1 arquivo por frame)."}),
+                "png_in_subfolder": ("BOOLEAN", {"default": True,
+                                "tooltip": "Cria uma pasta dedicada pra sequencia de PNG."}),
+                "png_prefix": ("STRING", {"default": "frame",
+                    "tooltip": "Prefixo dos arquivos PNG (ex: frame_00001.png)."}),
+                "date_subfolder": ("BOOLEAN", {"default": False,
+                                "tooltip": "Cria subpasta com a data (YYYY-MM-DD)."}),
+                "pingpong": ("BOOLEAN", {"default": False,
+                    "tooltip": "Anexa o video invertido no fim (efeito ida-e-volta)."}),
+                "audio": ("AUDIO", {"tooltip": "Opcional: trilha de audio pra embutir no MP4 (best-effort)."}),
+                "bit_depth": (["8-bit (padrão)", "10-bit (menos banding)"], {"default": "8-bit (padrão)",
+                    "tooltip": "10-bit mantem os frames em 16-bit ate a hora de codificar (em vez de "
+                    "cortar pra 256 niveis logo de cara), reduzindo o banding que o proprio encode "
+                    "introduz em gradientes/ceus/pele. Ajusta sozinho: pix_fmt vira a variante *10le "
+                    "(ex.: yuv420p -> yuv420p10le); codec h264 vira h265 (libx264 nao faz 10-bit "
+                    "decente); vp9 ganha profile 2. Precisa do PyAV (padrao do ComfyUI). Nao remove "
+                    "banding que ja veio da geracao -- pra isso, use o node de anti-banding/dither "
+                    "antes deste."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("mp4_path", "png_folder")
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = "Bruxos do VFX/Video"
+
+    def _frames_uint8(self, images, pingpong):
+        return self._frames_arr(images, pingpong, "8-bit")
+
+    def _frames_arr(self, images, pingpong, bit_depth="8-bit"):
+        t = images
+        # ---- normaliza QUALQUER forma p/ [T,H,W,C] com C em {1,3,4} ----------
+        # O imageio so aceita frame 2D ou 3D com 1/2/3/4 canais. Aqui a gente
+        # tolera o que chegar (5D com batch, mascara 3D, canais extras) em vez
+        # de quebrar la dentro com "Image must have 1, 2, 3 or 4 channels".
+        shape_in = tuple(t.shape)
+        try:
+            # 5D+ (ex.: [B,T,H,W,C]) -> junta/descarta as dims de batch da frente
+            while t.dim() > 4:
+                if int(t.shape[0]) == 1:
+                    t = t[0]                      # batch 1: so remove
+                else:
+                    t = t.reshape(-1, *t.shape[-3:])   # varios: empilha no tempo
+            # 3D: pode ser [T,H,W] (mascara) -> vira 3 canais
+            if t.dim() == 3:
+                t = t.unsqueeze(-1).repeat(1, 1, 1, 3)
+            elif t.dim() == 2:                    # [H,W] -> 1 frame RGB
+                t = t.unsqueeze(0).unsqueeze(-1).repeat(1, 1, 1, 3)
+            if t.dim() != 4:
+                raise ValueError(f"forma nao suportada {shape_in}")
+
+            # channels-first? [T,C,H,W] em vez de [T,H,W,C]. Acontece quando o
+            # VAE ligado nao e o VAE DE VIDEO do Wan (ex.: um VAE 'imageonly' /
+            # 'upscale2x'), que devolve o tensor no layout do torch.
+            c_last, c_first = int(t.shape[-1]), int(t.shape[1])
+            if c_last not in (1, 3, 4) and c_first in (1, 3, 4):
+                print(f"[Bruxos Save Video] *** tensor veio CHANNELS-FIRST {shape_in} "
+                      f"(esperado [frames,altura,largura,canais]). Corrigindo. "
+                      f"CAUSA TIPICA: o VAE ligado nao e o VAE de VIDEO do Wan "
+                      f"(um VAE 'imageonly'/'upscale2x' devolve neste layout). "
+                      f"Troque para o Wan VAE padrao.", flush=True)
+                t = t.permute(0, 2, 3, 1).contiguous()
+
+            c = int(t.shape[-1])
+            if c == 2:                            # 2 canais nao viram video
+                t = t[..., :1]
+                c = 1
+            if c == 1:                            # cinza -> RGB
+                t = t.repeat(1, 1, 1, 3)
+            elif c > 4:                           # canais extras (latente?) -> RGB
+                logging.info(f"[Bruxos Save Video] {c} canais recebidos; usando os 3 primeiros.")
+                t = t[..., :3]
+            elif c == 4 and str(getattr(self, "_drop_alpha", True)):
+                t = t[..., :3]                    # yuv420p nao leva alpha
+        except Exception as e:
+            raise RuntimeError(
+                f"[Bruxos Save Video] nao consegui interpretar o que chegou em 'images': "
+                f"shape={shape_in} ({e}). Esperado um IMAGE [frames, altura, largura, 3]. "
+                f"Confira o node ligado na entrada 'images'."
+            )
+
+        if tuple(t.shape) != shape_in:
+            logging.info(f"[Bruxos Save Video] images {shape_in} -> {tuple(t.shape)} (normalizado)")
+
+        # ---- DIAGNOSTICO: NaN/Inf ou tudo-preto ------------------------------
+        # NaN vira 0 no astype(uint8) => VIDEO PRETO, sem erro nenhum. Melhor
+        # gritar do que gravar um preto silencioso.
+        try:
+            tf = t.float()
+            n_nan = int(torch.isnan(tf).sum())
+            n_inf = int(torch.isinf(tf).sum())
+            vmin = float(tf.nan_to_num(0.0).min())
+            vmax = float(tf.nan_to_num(0.0).max())
+            if n_nan or n_inf:
+                print(f"[Bruxos Save Video] *** ATENCAO: {n_nan} NaN e {n_inf} Inf no video! "
+                      f"NaN vira PRETO no arquivo final. Causa tipica: o modelo gerou lixo "
+                      f"(fp16 estourando -> use bf16, ou modelo quantizado/attention incompativel). "
+                      f"O video sera gravado mesmo assim (NaN -> 0).", flush=True)
+                tf = tf.nan_to_num(0.0, posinf=1.0, neginf=0.0)
+                t = tf
+            elif vmax <= 0.003:
+                print(f"[Bruxos Save Video] *** ATENCAO: o video esta PRETO "
+                      f"(valor maximo={vmax:.4f}). Nao e o Save Video: o que chegou ja veio "
+                      f"preto do node anterior.", flush=True)
+            elif vmax > 1.5 or vmin < -0.5:
+                print(f"[Bruxos Save Video] aviso: valores fora de 0..1 "
+                      f"(min={vmin:.3f} max={vmax:.3f}); vou cortar (clamp).", flush=True)
+            logging.info(f"[Bruxos Save Video] {tuple(t.shape)} min={vmin:.3f} max={vmax:.3f}")
+        except Exception:
+            pass
+
+        if str(bit_depth).startswith("10"):
+            # Mantem em 16-bit (0..65535) em vez de cortar pra 256 niveis aqui --
+            # e essa precisao extra que o encode 10-bit realmente aproveita pra
+            # reduzir banding. Se cortasse pra uint8 e so depois "subisse" pro
+            # container de 10-bit, o 10-bit nao ganharia nada de verdade.
+            arr = (t.clamp(0, 1).cpu().numpy() * 65535.0).round().astype(np.uint16)
+        else:
+            arr = (t.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
+        frames = [arr[i] for i in range(arr.shape[0])]
+        if pingpong and len(frames) > 2:
+            frames = frames + frames[-2:0:-1]
+        return frames
+
+    def _resolve_outdir(self, filename_prefix, date_subfolder):
+        base = folder_paths.get_output_directory() if _HAS_FP else os.path.abspath("output")
+        sub = os.path.dirname(filename_prefix)
+        name = os.path.basename(filename_prefix) or "video"
+        out_dir = os.path.join(base, sub)
+        if date_subfolder:
+            out_dir = os.path.join(out_dir, datetime.date.today().isoformat())
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir, name
+
+    def _next_counter(self, out_dir, name):
+        n = 1
+        for f in os.listdir(out_dir):
+            if f.startswith(name + "_") and f.endswith(".mp4"):
+                try:
+                    n = max(n, int(f[len(name) + 1:].split("_")[0].split(".")[0]) + 1)
+                except Exception:
+                    pass
+        return n
+
+    def save(self, images, filename_prefix, fps, save_mp4=True, codec="h264", crf=19,
+             pix_fmt="yuv420p", save_png_sequence=False, png_in_subfolder=True,
+             png_prefix="frame", date_subfolder=False, pingpong=False, audio=None,
+             bit_depth="8-bit (padrão)"):
+        out_dir, name = self._resolve_outdir(filename_prefix, date_subfolder)
+        counter = self._next_counter(out_dir, name)
+        is_10bit = str(bit_depth).startswith("10")
+        frames = self._frames_arr(images, pingpong, "10-bit" if is_10bit else "8-bit")
+
+        mp4_path = ""
+        png_folder = ""
+        ui_files = []
+
+        if save_png_sequence:
+            if png_in_subfolder:
+                png_folder = os.path.join(out_dir, f"{name}_{counter:05d}_pngs")
+            else:
+                png_folder = out_dir
+            _write_png_sequence(frames, png_folder, prefix=png_prefix, start=1)
+
+        if save_mp4:
+            enc_codec, enc_pixfmt, avisos = _apply_bit_depth(codec, pix_fmt, bit_depth)
+            for aviso in avisos:
+                print(f"[Bruxos Save Video] {aviso}", flush=True)
+            ext = "webm" if enc_codec == "vp9" else ("mov" if enc_codec == "prores" else "mp4")
+            mp4_path = os.path.join(out_dir, f"{name}_{counter:05d}.{ext}")
+            if is_10bit:
+                if not _HAS_AV:
+                    raise RuntimeError(
+                        "[Bruxos Save Video] 10-bit precisa do PyAV (biblioteca 'av'), que normalmente "
+                        "ja vem com o ComfyUI. Nao encontrei -- confira a instalacao, ou desligue o "
+                        "bit_depth pra 8-bit."
+                    )
+                _encode_mp4_av(frames, mp4_path, fps, enc_codec, crf, enc_pixfmt)
+            elif _HAS_IMAGEIO:
+                _encode_mp4_imageio(frames, mp4_path, fps, enc_codec, crf, enc_pixfmt)
+            elif _HAS_AV:
+                _encode_mp4_av(frames, mp4_path, fps, enc_codec, crf, enc_pixfmt)
+            else:
+                raise RuntimeError("[Bruxos Save Video] sem backend de encode (imageio-ffmpeg ou av).")
+            _mux_audio(mp4_path, audio, fps)
+            try:
+                base = folder_paths.get_output_directory() if _HAS_FP else os.path.abspath("output")
+                rel_sub = os.path.relpath(os.path.dirname(mp4_path), base)
+                ui_files.append({"filename": os.path.basename(mp4_path),
+                                 "subfolder": "" if rel_sub == "." else rel_sub,
+                                 "type": "output", "format": f"video/{ext if ext!='mov' else 'quicktime'}"})
+            except Exception:
+                pass
+
+        logging.info(f"[Bruxos Save Video] mp4={mp4_path or '-'} png={png_folder or '-'} frames={len(frames)}")
+        return {"ui": {"gifs": ui_files}, "result": (mp4_path, png_folder)}
+
+
+def _encode_mp4_av(frames_arr, out_path, fps, codec="h264", crf=19, pix_fmt="yuv420p"):
+    lib = _CODEC_MAP.get(codec, "libx264")
+    hi = bool(len(frames_arr)) and frames_arr[0].dtype == np.uint16
+    container = av.open(out_path, mode="w")
+    stream = container.add_stream(lib, rate=Fraction(fps).limit_denominator(100000))
+    stream.width = frames_arr[0].shape[1]
+    stream.height = frames_arr[0].shape[0]
+    stream.pix_fmt = pix_fmt
+    opts = {}
+    if codec in ("h264", "h265"):
+        opts["crf"] = str(crf)
+    if codec == "vp9" and hi:
+        opts["profile"] = "2"  # vp9 profile 2 = 10/12-bit
+    if opts:
+        stream.options = opts
+    src_fmt = "rgb48le" if hi else "rgb24"
+    for f in frames_arr:
+        frame = av.VideoFrame.from_ndarray(f, format=src_fmt)
+        for pkt in stream.encode(frame):
+            container.mux(pkt)
+    for pkt in stream.encode():
+        container.mux(pkt)
+    container.close()
+    return out_path
+
+
+NODE_CLASS_MAPPINGS = {
+    "BruxosLoadVideo": BruxosLoadVideo,
+    "BruxosSaveVideo": BruxosSaveVideo,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "BruxosLoadVideo": "Load Video (Bruxos)",
+    "BruxosSaveVideo": "Save Video (Bruxos)",
+}
+
+
+# --- Descricoes em portugues ---------------------------------------------
+BruxosLoadVideo.DESCRIPTION = (
+    "Load Video (Bruxos) — importa um video e ja entrega o tipo VIDEO nativo dos "
+    "nodes 2.0, alem dos frames.\n"
+    "- video: seletor de arquivos da pasta ComfyUI/input (use o botao de upload "
+    "pra enviar um arquivo novo).\n"
+    "- video_path: caminho absoluto (ex: C:\\\\...\\\\clip.mp4). Tem prioridade "
+    "sobre o seletor.\n"
+    "- force_rate: reamostra pra esse fps (0 = mantem o original).\n"
+    "- custom_width / custom_height: redimensiona (0 = mantem; se so um lado for "
+    ">0, mantem a proporcao).\n"
+    "- frame_load_cap: maximo de frames a carregar (0 = todos).\n"
+    "- skip_first_frames: pula os N primeiros frames.\n"
+    "- select_every_nth: pega 1 a cada N frames.\n"
+    "- importar_mais_bits: decodifica em 16-bit via PyAV em vez de 8-bit direto -- "
+    "preserva a precisao real de fontes 10/12-bit (ProRes, H.265 Main10 etc.). "
+    "Fonte 8-bit: resultado identico, so custa mais CPU.\n"
+    "SAIDAS: images, video (VIDEO nativo), audio, fps, frame_count, video_info (JSON) "
+    "e Cache (BRUXOS_FRAME_CACHE), pronto para ligar direto no source_cache do "
+    "Bernini Infinity SSD 81. A pasta e criada automaticamente em ComfyUI/temp e "
+    "reaproveitada quando o arquivo e as opcoes de carga nao mudaram."
+)
+
+BruxosSaveVideo.DESCRIPTION = (
+    "Save Video (Bruxos) — exporta com mais opcoes que o VideoHelperSuite, "
+    "criando pastas.\n"
+    "- images: frames a salvar.\n"
+    "- filename_prefix: prefixo/caminho relativo dentro de ComfyUI/output "
+    "(subpastas sao criadas).\n"
+    "- fps: quadros por segundo do arquivo.\n"
+    "- save_mp4: liga/desliga a exportacao de video.\n"
+    "- codec: h264 (.mp4), h265 (.mp4), vp9 (.webm) ou prores (.mov).\n"
+    "- crf: qualidade (menor = melhor/maior arquivo) p/ h264/h265.\n"
+    "- pix_fmt: formato de pixel (yuv420p e o mais compativel).\n"
+    "- save_png_sequence: salva tambem a sequencia de PNG.\n"
+    "- png_in_subfolder: cria uma pasta dedicada pra sequencia.\n"
+    "- png_prefix: prefixo dos arquivos PNG.\n"
+    "- date_subfolder: cria uma subpasta com a data (YYYY-MM-DD).\n"
+    "- pingpong: anexa o video invertido no fim (ida e volta).\n"
+    "- audio (opcional): trilha pra embutir no MP4 (best-effort).\n"
+    "- bit_depth: 10-bit mantem os frames em 16-bit ate codificar (em vez de cortar pra "
+    "256 niveis logo de cara), reduzindo o banding que o proprio encode introduz. Ajusta "
+    "codec/pix_fmt sozinho (h264->h265, pix_fmt->*10le). Nao remove banding que ja veio "
+    "da geracao -- combine com um node de anti-banding/dither antes deste.\n"
+    "SAIDAS: mp4_path e png_folder (caminhos do que foi salvo)."
+)

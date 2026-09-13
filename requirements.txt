@@ -1,0 +1,6 @@
+# Bruxos — Media I/O (imagem e video) — dependencias
+# NAO liste torch/numpy/xformers aqui: o ComfyUI ja traz.
+
+opencv-python
+imageio[ffmpeg]
+scenedetect>=0.6

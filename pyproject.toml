@@ -1,0 +1,14 @@
+[project]
+name = "ComfyUI-Bruxos-MediaIO"
+description = "Load Image, Load Video, Save Video, cache de frames em SSD, deband e comparador A/B de video. Tudo que entra e sai de midia."
+version = "2.0.0"
+license = { text = "Apache-2.0" }
+dependencies = ["opencv-python", "imageio[ffmpeg]", "scenedetect>=0.6"]
+
+[project.urls]
+Repository = "https://github.com/SEU-USUARIO/ComfyUI-Bruxos-MediaIO"
+
+[tool.comfy]
+PublisherId = "bruxos-do-vfx"
+DisplayName = "Bruxos — Media I/O (imagem e video)"
+Icon = ""
