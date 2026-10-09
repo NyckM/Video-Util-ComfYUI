@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ComfyUI-Bruxos-MediaIO
 
-Load Image, Load Video, Save Video, cache de frames em SSD, deband e comparador A/B de video. Tudo que entra e sai de midia.
+Load Image, Load EXR (+OCIO), Load Video, Save Video, cache de frames em SSD, deband e comparador A/B de video. Tudo que entra e sai de midia.
 
 Separado do pacote unico ComfyUI-Bruxos-do-VFX.
 """
@@ -25,6 +25,8 @@ def _merge(modname):
 _merge("video_nodes")
 _merge("bruxos_load_media")
 _merge("bruxos_load_media_v2")
+_merge("bruxos_load_exr")
+_merge("bruxos_hold_seconds")
 _merge("bruxos_save_video_v2")
 _merge("bruxos_disk_stream")
 _merge("bruxos_deband")
