@@ -6,7 +6,7 @@ license = { text = "Apache-2.0" }
 dependencies = ["opencv-python", "imageio[ffmpeg]", "scenedetect>=0.6"]
 
 [project.urls]
-Repository = "https://github.com/SEU-USUARIO/ComfyUI-Bruxos-MediaIO"
+Repository = "https://github.com/NyckM/Video-Util-ComfYUI"
 
 [tool.comfy]
 PublisherId = "bruxos-do-vfx"

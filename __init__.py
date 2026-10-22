@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ComfyUI-Bruxos-MediaIO
+"""Video-Util-ComfYUI (Bruxos Media I/O)
 
 Load Image, Load EXR (+OCIO), Load Video, Save Video, cache de frames em SSD, deband e comparador A/B de video. Tudo que entra e sai de midia.
 
